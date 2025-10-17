@@ -1,0 +1,728 @@
+import os
+import json
+import threading
+import time
+import logging
+from flask import Flask, render_template_string, request, jsonify
+import uuid
+from datetime import datetime
+import random
+import queue
+from pathlib import Path
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# Vercel-specific configuration
+IS_VERCEL = os.environ.get('VERCEL') == '1'
+
+# -------------------------
+# Configuration & Persistence (Simplified for Vercel)
+# -------------------------
+WS_ENDPOINT = "wss://ws.binaryws.com/websockets/v3"
+RECONNECT_DELAY = 5
+PING_INTERVAL = 15
+MAX_REQUESTS_PER_SECOND = 3
+
+# In-memory storage for Vercel (no file system persistence)
+bot_settings = {}
+
+def save_settings(api_key, app_id, account_id):
+    """Save settings to memory (Vercel-compatible)"""
+    try:
+        bot_settings.update({
+            'api_key': api_key,
+            'app_id': app_id,
+            'account_id': account_id
+        })
+        logger.info("✅ Settings saved to memory.")
+    except Exception as e:
+        logger.error(f"⚠️ Failed to save settings: {e}")
+
+def load_settings():
+    """Load settings from memory"""
+    return bot_settings.copy()
+
+# -------------------------
+# Rate Limiter (Keep as is)
+# -------------------------
+class RateLimiter:
+    def __init__(self, rate_per_sec: float):
+        self.rate = rate_per_sec
+        self.allowance = rate_per_sec
+        self.last_check = time.time()
+        self.lock = threading.Lock()
+
+    def wait_for_slot(self):
+        while True:
+            with self.lock:
+                current = time.time()
+                time_passed = current - self.last_check
+                self.last_check = current
+                self.allowance += time_passed * self.rate
+                if self.allowance > self.rate:
+                    self.allowance = self.rate
+                if self.allowance >= 1.0:
+                    self.allowance -= 1.0
+                    return
+            time.sleep(0.01)
+
+# -------------------------
+# Simplified Deriv Client for Vercel
+# -------------------------
+class DerivWebsocketClient:
+    def __init__(self, endpoint: str, token: str, app_id: str = "1089", account_id: str = None):
+        self.endpoint = f"{endpoint}?app_id={app_id}"
+        self.token = token
+        self.app_id = app_id
+        self.expected_account_id = account_id
+        self.ws = None
+        self.thread = None
+        self.running = False
+        self.req_id_counter = 0
+        self.pending_req_map = {}
+        self.active_contracts = {}
+        self.rate_limiter = RateLimiter(MAX_REQUESTS_PER_SECOND)
+        self.incoming_queue = queue.Queue()
+        self.connected = False
+        self.authorized = False
+        self.account_id = None
+        self.is_demo = False
+        self.balance = 0.0
+        self.currency = "USD"
+        
+        # Trading data
+        self.recent_proposals = {}
+        self.trade_history = []
+        self.last_pong = time.time()
+        
+        # Callbacks
+        self.on_authorize = None
+        self.on_balance = None
+        self.on_tick = None
+        self.on_buy = None
+        self.on_sell = None
+        self.on_proposal = None
+        self.on_trade_error = None
+        self.on_contract_update = None
+
+    def _next_req_id(self):
+        self.req_id_counter += 1
+        return self.req_id_counter
+
+    def _send(self, payload: dict):
+        self.rate_limiter.wait_for_slot()
+        try:
+            s = json.dumps(payload)
+            logger.debug(">>> %s", s)
+            if self.ws:
+                self.ws.send(s)
+        except Exception as e:
+            logger.exception("Send failed: %s", e)
+
+    def connect_and_run(self):
+        """Simplified connection for Vercel - no auto-reconnect"""
+        if IS_VERCEL:
+            logger.info("Running on Vercel - WebSocket connections may have limitations")
+        
+        self.running = True
+        try:
+            import websocket
+            logger.info("Connecting to %s", self.endpoint)
+            self.ws = websocket.WebSocketApp(self.endpoint,
+                                             on_open=self._on_open,
+                                             on_message=self._on_message,
+                                             on_error=self._on_error,
+                                             on_close=self._on_close)
+            
+            # Run in separate thread
+            self.thread = threading.Thread(target=self.ws.run_forever, 
+                                         kwargs={"ping_interval": PING_INTERVAL, "ping_timeout": 10}, 
+                                         daemon=True)
+            self.thread.start()
+
+            # Start message processor
+            processor_thread = threading.Thread(target=self._process_incoming, daemon=True)
+            processor_thread.start()
+
+            # Start keepalive
+            self._start_keepalive()
+
+        except Exception as e:
+            logger.exception("Connection failed: %s", e)
+
+    def _start_keepalive(self):
+        def ping_loop():
+            while self.running:
+                try:
+                    if self.connected:
+                        self._send({"ping": 1})
+                except Exception:
+                    logger.exception("Keepalive ping failed")
+                time.sleep(PING_INTERVAL)
+        t = threading.Thread(target=ping_loop, daemon=True)
+        t.start()
+
+    def _on_open(self, ws):
+        logger.info("WebSocket opened, authorizing...")
+        self.connected = True
+        self.authorize()
+
+    def _on_error(self, ws, error):
+        logger.error("WebSocket error: %s", error)
+        self.connected = False
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        logger.warning("WebSocket closed: %s %s", close_status_code, close_msg)
+        self.connected = False
+        self.authorized = False
+
+    def _on_message(self, ws, message):
+        try:
+            logger.debug("<<< %s", message)
+            data = json.loads(message)
+            self.incoming_queue.put(data)
+        except Exception as e:
+            logger.exception("Failed to parse incoming message: %s", e)
+
+    def _process_incoming(self):
+        while self.running:
+            try:
+                data = self.incoming_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            req_id = data.get("req_id")
+            error_msg = data.get("error", {}).get("message") if "error" in data else None
+
+            if error_msg:
+                logger.error("API error: %s", error_msg)
+                if req_id in self.pending_req_map:
+                    del self.pending_req_map[req_id]
+                continue
+
+            if "pong" in data:
+                self.last_pong = time.time()
+                continue
+
+            if "authorize" in data:
+                auth = data["authorize"]
+                self.account_id = auth.get("loginid")
+                self.is_demo = auth.get("loginid", "").startswith('VRTC')
+                self.authorized = True
+                self.currency = auth.get("currency", "USD")
+                
+                logger.info(f"✅ Authorized. Login id: {self.account_id}, currency: {self.currency}")
+                
+                if self.on_authorize:
+                    self.on_authorize(auth)
+                
+                self.get_balance(subscribe=True)
+                continue
+
+            if "balance" in data:
+                balance_data = data.get("balance", {})
+                self.balance = float(balance_data.get("balance", 0))
+                logger.info("Balance update: %.2f %s", self.balance, self.currency)
+                
+                if self.on_balance:
+                    self.on_balance(balance_data)
+                continue
+
+            if "tick" in data:
+                tick = data["tick"]
+                if self.on_tick:
+                    self.on_tick(tick)
+                continue
+
+            if "buy" in data:
+                buy_resp = data["buy"]
+                contract_id = buy_resp.get("contract_id")
+                req_id = data.get("req_id")
+                
+                if req_id in self.pending_req_map:
+                    pending_req = self.pending_req_map[req_id]
+                    
+                    contract_data = {
+                        "symbol": pending_req.get("symbol"),
+                        "contract_type": pending_req.get("contract_type"),
+                        "amount": pending_req.get("amount"),
+                        "payout": buy_resp.get("payout"),
+                        "purchase_time": time.time(),
+                        "status": "open",
+                    }
+                    self.active_contracts[contract_id] = contract_data
+                    
+                    if self.on_buy:
+                        self.on_buy(contract_id, contract_data, buy_resp)
+                    
+                    del self.pending_req_map[req_id]
+                continue
+
+            logger.debug("Unhandled incoming message: %s", data)
+
+    def authorize(self):
+        req_id = self._next_req_id()
+        payload = {"authorize": self.token, "req_id": req_id}
+        self.pending_req_map[req_id] = {"type": "authorize", "time": time.time()}
+        self._send(payload)
+        return req_id
+
+    def get_balance(self, subscribe: bool = True):
+        req_id = self._next_req_id()
+        payload = {"balance": 1, "subscribe": 1 if subscribe else 0, "req_id": req_id}
+        self.pending_req_map[req_id] = {"type": "balance", "time": time.time()}
+        self._send(payload)
+        return req_id
+
+    def subscribe_ticks(self, symbol: str):
+        req_id = self._next_req_id()
+        payload = {
+            "ticks": symbol,
+            "subscribe": 1,
+            "req_id": req_id
+        }
+        self.pending_req_map[req_id] = {"type": "ticks_subscribe", "symbol": symbol, "time": time.time()}
+        self._send(payload)
+        return req_id
+
+    def place_real_trade(self, symbol: str, contract_type: str, duration: int, duration_unit: str, amount: float):
+        """Place real trade - simplified for Vercel"""
+        req_id = self._next_req_id()
+        payload = {
+            "buy": 1,
+            "price": amount,
+            "parameters": {
+                "amount": amount,
+                "basis": "stake",
+                "contract_type": contract_type.lower(),
+                "currency": self.currency,
+                "duration": duration,
+                "duration_unit": duration_unit,
+                "symbol": symbol
+            },
+            "req_id": req_id
+        }
+        self.pending_req_map[req_id] = {
+            "type": "buy", 
+            "symbol": symbol, 
+            "contract_type": contract_type,
+            "amount": amount,
+            "time": time.time()
+        }
+        self._send(payload)
+        return req_id
+
+    def stop(self):
+        self.running = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+
+# -------------------------
+# Simplified Trading Bot for Vercel
+# -------------------------
+class DerivHybridTradingBot:
+    def __init__(self):
+        self.ws = None
+        self.connected = False
+        self.authorized = False
+        self.account_id = None
+        self.api_key = None
+        self.app_id = "1089"
+        self.is_demo = True
+        self.active_trades = {}
+        self.account_balance = 1000
+        self.trading_enabled = False
+        self.selected_symbol = "R_100"
+        self.base_lot_size = 0.01
+        self.max_open_trades = 10
+        self.trade_count = 0
+        self.profit_loss = 0
+        
+        # Initialize Deriv client
+        self.deriv_client = None
+        
+        # Price data
+        self.price_history = {}
+        self.current_prices = {}
+
+    def connect_to_deriv(self):
+        """Connect to Deriv API - simplified for Vercel"""
+        try:
+            if not self.api_key:
+                logger.error("No API key provided")
+                return False
+            
+            # Import websocket only when needed
+            try:
+                import websocket
+            except ImportError:
+                logger.error("WebSocket library not available")
+                return False
+                
+            self.deriv_client = DerivWebsocketClient(WS_ENDPOINT, self.api_key, self.app_id, self.account_id)
+            
+            # Set up minimal callbacks
+            self.deriv_client.on_authorize = self._on_authorize
+            self.deriv_client.on_balance = self._on_balance
+            self.deriv_client.on_tick = self._on_tick
+            self.deriv_client.on_buy = self._on_buy
+            
+            self.deriv_client.connect_and_run()
+            
+            # Wait briefly for connection
+            time.sleep(2)
+            
+            if self.deriv_client and self.deriv_client.connected:
+                self.connected = True
+                logger.info(f"Connected to Deriv API")
+                return True
+            else:
+                logger.error("Failed to connect to Deriv API")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Connection error: {e}")
+            return False
+
+    def _on_authorize(self, auth_data):
+        self.authorized = True
+        self.account_id = auth_data.get("loginid")
+        self.is_demo = auth_data.get("loginid", "").startswith('VRTC')
+        logger.info(f"Authorization successful - Account: {self.account_id}")
+
+    def _on_balance(self, balance_data):
+        if self.deriv_client:
+            self.account_balance = self.deriv_client.balance
+            logger.info(f"Balance updated: {self.account_balance}")
+
+    def _on_tick(self, tick_data):
+        symbol = tick_data.get("symbol")
+        quote = tick_data.get("quote")
+        
+        if symbol and quote:
+            try:
+                price = float(quote)
+                self.current_prices[symbol] = price
+                
+                if symbol not in self.price_history:
+                    self.price_history[symbol] = []
+                self.price_history[symbol].append(price)
+                
+                if len(self.price_history[symbol]) > 50:
+                    self.price_history[symbol] = self.price_history[symbol][-25:]
+                    
+            except (ValueError, TypeError):
+                pass
+
+    def _on_buy(self, contract_id, trade_data, buy_response):
+        # Update active trades
+        for trade_id, trade in list(self.active_trades.items()):
+            if trade.get('req_id') == trade_data.get('req_id'):
+                trade['real_contract_id'] = contract_id
+                trade['status'] = 'open'
+                trade['contract_id'] = contract_id
+                logger.info(f"Trade confirmed with contract ID: {contract_id}")
+
+    def authorize_account(self):
+        if not self.api_key:
+            logger.error("No API key provided")
+            return
+            
+        if self.deriv_client:
+            self.deriv_client.authorize()
+    
+    def start_trading(self):
+        """Start trading - simplified for Vercel"""
+        if not self.authorized:
+            logger.error("Not authorized - cannot start trading")
+            return False
+        
+        self.trading_enabled = True
+        
+        # Subscribe to ticks
+        if self.deriv_client and self.deriv_client.authorized:
+            self.deriv_client.subscribe_ticks(self.selected_symbol)
+        
+        logger.info(f"Trading started on {self.selected_symbol}")
+        return True
+    
+    def stop_trading(self):
+        self.trading_enabled = False
+        if self.deriv_client:
+            self.deriv_client.stop()
+        logger.info("Trading stopped")
+    
+    def restart_bot(self):
+        """Restart the bot"""
+        logger.info("🔄 Restarting bot...")
+        self.stop_trading()
+        if self.deriv_client:
+            self.deriv_client.stop()
+        time.sleep(2)
+        return self.connect_to_deriv()
+
+# Global bot instance
+bot = DerivHybridTradingBot()
+
+# HTML Template (same as before, but shortened for brevity)
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Deriv Trading Bot</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+        .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); max-width: 800px; margin: 0 auto; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input, select { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; }
+        .btn { background: #007cba; color: white; padding: 12px 20px; border: none; border-radius: 5px; cursor: pointer; margin: 5px; }
+        .btn-stop { background: #dc3545; }
+        .btn-restart { background: #ffc107; color: black; }
+        .status { padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .connected { background: #d4edda; color: #155724; }
+        .disconnected { background: #f8d7da; color: #721c24; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Deriv Hybrid Trading Bot</h1>
+        <p>Running on Vercel - Web Interface</p>
+        
+        <div class="form-group">
+            <label>Connection Status:</label>
+            <div id="connectionStatus" class="status disconnected">Disconnected</div>
+        </div>
+        
+        <form id="connectionForm">
+            <div class="form-group">
+                <label for="apiKey">API Key:</label>
+                <input type="password" id="apiKey" placeholder="Enter your Deriv API key">
+            </div>
+            <div class="form-group">
+                <label for="accountId">Account ID:</label>
+                <input type="text" id="accountId" placeholder="Enter your Account ID">
+            </div>
+            <div class="form-group">
+                <label for="appId">App ID:</label>
+                <input type="text" id="appId" value="1089">
+            </div>
+            <button type="button" class="btn" onclick="connectBot()">Connect</button>
+            <button type="button" class="btn btn-stop" onclick="disconnectBot()">Disconnect</button>
+            <button type="button" class="btn btn-restart" onclick="restartBot()">Restart</button>
+        </form>
+        
+        <div class="form-group">
+            <label>Trading Status: <span id="tradingStatus">Stopped</span></label>
+            <button type="button" class="btn" onclick="startTrading()">Start Trading</button>
+            <button type="button" class="btn btn-stop" onclick="stopTrading()">Stop Trading</button>
+        </div>
+        
+        <div id="statusInfo"></div>
+    </div>
+
+    <script>
+        function connectBot() {
+            const apiKey = document.getElementById('apiKey').value;
+            const accountId = document.getElementById('accountId').value;
+            const appId = document.getElementById('appId').value;
+            
+            fetch('/connect', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({api_key: apiKey, account_id: accountId, app_id: appId})
+            })
+            .then(response => response.json())
+            .then(data => {
+                alert(data.message);
+                updateStatus();
+            });
+        }
+        
+        function disconnectBot() {
+            fetch('/disconnect', {method: 'POST'})
+            .then(response => response.json())
+            .then(data => {
+                alert(data.message);
+                updateStatus();
+            });
+        }
+        
+        function restartBot() {
+            fetch('/restart', {method: 'POST'})
+            .then(response => response.json())
+            .then(data => {
+                alert(data.message);
+                updateStatus();
+            });
+        }
+        
+        function startTrading() {
+            fetch('/start_trading', {method: 'POST'})
+            .then(response => response.json())
+            .then(data => {
+                alert(data.message);
+                updateStatus();
+            });
+        }
+        
+        function stopTrading() {
+            fetch('/stop_trading', {method: 'POST'})
+            .then(response => response.json())
+            .then(data => {
+                alert(data.message);
+                updateStatus();
+            });
+        }
+        
+        function updateStatus() {
+            fetch('/status')
+            .then(response => response.json())
+            .then(data => {
+                const statusEl = document.getElementById('connectionStatus');
+                statusEl.textContent = data.connected ? 'Connected' : 'Disconnected';
+                statusEl.className = 'status ' + (data.connected ? 'connected' : 'disconnected');
+                
+                document.getElementById('tradingStatus').textContent = 
+                    data.trading_enabled ? 'Trading Active' : 'Stopped';
+            });
+        }
+        
+        // Load saved settings
+        window.addEventListener('load', function() {
+            fetch('/load_settings')
+            .then(response => response.json())
+            .then(data => {
+                if (data.api_key) document.getElementById('apiKey').value = data.api_key;
+                if (data.account_id) document.getElementById('accountId').value = data.account_id;
+                if (data.app_id) document.getElementById('appId').value = data.app_id;
+            });
+            
+            setInterval(updateStatus, 5000);
+            updateStatus();
+        });
+    </script>
+</body>
+</html>
+'''
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route("/connect", methods=["POST"])
+def connect():
+    try:
+        data = request.get_json()
+        api_key = data.get("api_key")
+        account_id = data.get("account_id")
+        app_id = data.get("app_id", "1089")
+
+        if not api_key:
+            return jsonify({"status": "error", "message": "Missing API key"})
+
+        bot.api_key = api_key
+        bot.account_id = account_id
+        bot.app_id = app_id
+
+        # Save settings
+        save_settings(api_key, app_id, account_id)
+
+        connected = bot.connect_to_deriv()
+        if connected:
+            bot.authorize_account()
+            return jsonify({"status": "success", "message": f"Connected to account {account_id}"})
+        else:
+            return jsonify({"status": "error", "message": "Failed to connect"})
+
+    except Exception as e:
+        logger.exception("Connection error")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/disconnect", methods=["POST"])
+def disconnect():
+    try:
+        bot.stop_trading()
+        if bot.deriv_client:
+            bot.deriv_client.stop()
+        bot.connected = False
+        bot.authorized = False
+        return jsonify({"status": "success", "message": "Disconnected successfully"})
+    except Exception as e:
+        logger.exception("Disconnect error")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/restart", methods=["POST"])
+def restart():
+    try:
+        success = bot.restart_bot()
+        if success:
+            return jsonify({"status": "success", "message": "Bot restarted successfully"})
+        else:
+            return jsonify({"status": "error", "message": "Failed to restart bot"})
+    except Exception as e:
+        logger.exception("Restart error")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/load_settings", methods=["GET"])
+def load_settings_endpoint():
+    try:
+        settings = load_settings()
+        return jsonify(settings)
+    except Exception as e:
+        logger.exception("Load settings error")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/start_trading", methods=["POST"])
+def start_trading():
+    try:
+        started = bot.start_trading()
+        if started:
+            return jsonify({"status": "success", "message": "Trading started"})
+        else:
+            return jsonify({"status": "error", "message": "Failed to start trading"})
+    except Exception as e:
+        logger.exception("Start trading error")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/stop_trading", methods=["POST"])
+def stop_trading():
+    try:
+        bot.stop_trading()
+        return jsonify({"status": "success", "message": "Trading stopped"})
+    except Exception as e:
+        logger.exception("Stop trading error")
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route("/status", methods=["GET"])
+def status():
+    try:
+        return jsonify({
+            "connected": bot.connected,
+            "authorized": bot.authorized,
+            "trading_enabled": bot.trading_enabled,
+            "account_type": "Demo" if bot.is_demo else "Real",
+            "app_id": bot.app_id,
+            "account_id": bot.account_id,
+            "active_trades": len(bot.active_trades),
+            "total_trades": bot.trade_count,
+        })
+    except Exception as e:
+        logger.exception("Status check error")
+        return jsonify({"status": "error", "message": str(e)})
+
+# Vercel handler
+if __name__ == "__main__":
+    print("🚀 Starting Deriv Trading Bot on Vercel")
+    print("🌍 Web Interface running at: http://127.0.0.1:5000")
+    app.run(host="0.0.0.0", port=5000, debug=False)
+else:
+    # For Vercel serverless
+    print("🚀 Deriv Trading Bot initialized on Vercel")
